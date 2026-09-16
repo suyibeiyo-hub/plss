@@ -12,3 +12,6 @@ makro_uploader.sqlite3-wal
 *.csv
 .DS_Store
 .github-token
+dist/
+*.zip
+*.exe

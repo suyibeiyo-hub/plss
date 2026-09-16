@@ -3,10 +3,11 @@ name: Build Windows 10 package
 on:
   push:
     branches: [main, master]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-windows:
@@ -46,3 +47,15 @@ jobs:
           name: MakroUploader-Windows10
           path: dist/MakroUploader-Windows10.zip
           if-no-files-found: error
+
+      - name: Publish GitHub Release package
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create $env:GITHUB_REF_NAME
+          dist/MakroUploader-Windows10.zip
+          --repo $env:GITHUB_REPOSITORY
+          --title "MakroUploader $env:GITHUB_REF_NAME"
+          --notes "Windows 10 portable package."
