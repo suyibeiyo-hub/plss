@@ -103,19 +103,58 @@ class UploadWorker(QObject):
                     listing_row = make_listing_row(row_number, values, mapping, shipping_days_override)
                     product_id = listing_row.product_id
                     sku = self.db.latest_sku_for_fingerprint(listing_row.fingerprint) or self.db.allocate_sku(self.config["sku_seed"])
-                    self.status.emit(f"第 {processed}/{total} 条，SKU {sku}，等待请求")
-                    delay = random.uniform(self.config["delay_min"], self.config["delay_max"])
-                    if not wait_with_stop(delay, self.stop_event):
-                        break
-                    result = client.upload(listing_row, sku)
-                    status = "success" if result.ok else "failure"
-                    message = result.message
-                    if result.ok:
-                        success_count += 1
-                    else:
-                        failure_count += 1
-                    self.db.add_upload(run_id, path, self.config["sheet_name"], listing_row, sku, status, message, result.http_status, result.response)
-                    self.row_result.emit({"row": row_number, "sku": sku, "product_id": product_id, "status": status, "message": message})
+                    conflict_retries = 0
+                    while True:
+                        self.status.emit(f"第 {processed}/{total} 条，SKU {sku}，等待请求")
+                        delay = random.uniform(self.config["delay_min"], self.config["delay_max"])
+                        if not wait_with_stop(delay, self.stop_event):
+                            break
+                        result = client.upload(listing_row, sku)
+                        if result.ok:
+                            status = "success"
+                            message = result.message
+                            success_count += 1
+                            self.db.add_upload(run_id, path, self.config["sheet_name"], listing_row, sku, status, message, result.http_status, result.response)
+                            self.row_result.emit({"row": row_number, "sku": sku, "product_id": product_id, "status": status, "message": message})
+                            break
+
+                        if not result.sku_conflict:
+                            status = "failure"
+                            message = result.message
+                            failure_count += 1
+                            self.db.add_upload(run_id, path, self.config["sheet_name"], listing_row, sku, status, message, result.http_status, result.response)
+                            self.row_result.emit({"row": row_number, "sku": sku, "product_id": product_id, "status": status, "message": message})
+                            break
+
+                        # Keep collision attempts in SQLite for auditing, but
+                        # don't export them as failed rows if a later SKU wins.
+                        conflict_retries += 1
+                        self.db.add_upload(
+                            run_id,
+                            path,
+                            self.config["sheet_name"],
+                            listing_row,
+                            sku,
+                            "retry",
+                            f"SKU {sku} 已存在，自动递增后重试：{result.message}",
+                            result.http_status,
+                            result.response,
+                        )
+                        self.row_result.emit({
+                            "row": row_number,
+                            "sku": sku,
+                            "product_id": product_id,
+                            "status": "retry",
+                            "message": f"SKU 已存在，准备使用下一个 SKU（第 {conflict_retries} 次）",
+                        })
+                        if conflict_retries >= 1000:
+                            status = "failure"
+                            message = f"连续 1000 个 SKU 已存在，停止自动递增：{result.message}"
+                            failure_count += 1
+                            self.db.add_upload(run_id, path, self.config["sheet_name"], listing_row, sku, status, message, result.http_status, result.response)
+                            self.row_result.emit({"row": row_number, "sku": sku, "product_id": product_id, "status": status, "message": message})
+                            break
+                        sku = self.db.allocate_sku(self.config["sku_seed"])
                 except Exception as exc:
                     failure_count += 1
                     message = str(exc)

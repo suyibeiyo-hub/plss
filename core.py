@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import random
 import re
 import sqlite3
@@ -101,9 +102,16 @@ class XlsxReader:
                     continue
                 name = sheet.attrib["name"]
                 relation_id = sheet.attrib[f"{{{NS_REL}}}id"]
-                target = rel_map[relation_id]
-                if not target.startswith("xl/"):
-                    target = "xl/" + target.lstrip("/")
+                # Relationship targets may be absolute package paths
+                # (``/xl/worksheets/sheet1.xml``) or paths relative to the
+                # ``xl`` directory (``worksheets/sheet1.xml``).  Strip the
+                # leading slash before checking the prefix, otherwise an
+                # absolute target becomes the invalid ``xl/xl/...`` path.
+                target = rel_map[relation_id].lstrip("/")
+                if target.startswith("../"):
+                    target = posixpath.normpath(posixpath.join("xl", target))
+                elif not target.startswith("xl/"):
+                    target = "xl/" + target
                 sheet_paths[name] = target
                 try:
                     # Do not read a multi-hundred-megabyte worksheet into
@@ -503,6 +511,7 @@ class HttpResult:
     message: str
     http_status: int | None
     response: Any
+    sku_conflict: bool = False
 
 
 class MakroClient:
@@ -552,7 +561,7 @@ class MakroClient:
             data = json.loads(raw)
         except json.JSONDecodeError:
             message = f"HTTP {status}: {raw[:500]}" if raw else f"HTTP {status}"
-            return HttpResult(False, message, status, raw[:4000])
+            return HttpResult(False, message, status, raw[:4000], sku_conflict=status == 409)
         result = data.get("result", {}) if isinstance(data, dict) else {}
         bulk = result.get("bulkResponse", []) if isinstance(result, dict) else []
         item = bulk[0] if bulk and isinstance(bulk[0], dict) else {}
@@ -575,7 +584,16 @@ class MakroClient:
                     errors.append(f"{field}: {error}")
         if not errors:
             errors.append(f"HTTP {status}: {json.dumps(data, ensure_ascii=False)[:700]}")
-        return HttpResult(False, "；".join(errors), status, data)
+        message = "；".join(errors)
+        message_lower = message.lower()
+        sku_conflict = status == 409 or bool(
+            re.search(
+                r"sku.{0,80}(already|exist|duplicate|unique|taken)|"
+                r"(already|exist|duplicate|unique|taken).{0,80}sku",
+                message_lower,
+            )
+        )
+        return HttpResult(False, message, status, data, sku_conflict=sku_conflict)
 
 
 def export_failed_xlsx(db: UploadDatabase, run_id: str, output_path: str | os.PathLike[str]) -> int:
