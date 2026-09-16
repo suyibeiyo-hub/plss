@@ -420,6 +420,11 @@ class UploadDatabase:
         ).fetchone()
         return str(row[0]) if row else None
 
+    def latest_upload_for_fingerprint(self, fingerprint: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM uploads WHERE row_fingerprint=? ORDER BY id DESC LIMIT 1", (fingerprint,)
+        ).fetchone()
+
     def add_upload(
         self,
         run_id: str,

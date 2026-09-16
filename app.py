@@ -91,9 +91,8 @@ class UploadWorker(QObject):
             self.status.emit(f"开始上传，共 {total} 条。")
             processed = 0
             for row_number, raw_values in reader.rows(self.config["sheet_name"], start_row=data_start_row):
-                if processed >= total or self.stop_event.is_set():
+                if self.stop_event.is_set():
                     break
-                processed += 1
                 values = raw_values[:-1] if (header_present and has_error_column) else raw_values
                 status = "failure"
                 message = ""
@@ -102,6 +101,20 @@ class UploadWorker(QObject):
                 try:
                     listing_row = make_listing_row(row_number, values, mapping, shipping_days_override)
                     product_id = listing_row.product_id
+                    latest_upload = self.db.latest_upload_for_fingerprint(listing_row.fingerprint)
+                    if latest_upload is not None and latest_upload["status"] == "success":
+                        self.status.emit(f"Excel 第 {row_number} 行已成功，自动跳过")
+                        self.row_result.emit({
+                            "row": row_number,
+                            "sku": latest_upload["sku"],
+                            "product_id": product_id,
+                            "status": "skipped",
+                            "message": "之前已成功上传，自动跳过",
+                        })
+                        continue
+                    if processed >= total:
+                        break
+                    processed += 1
                     sku = self.db.latest_sku_for_fingerprint(listing_row.fingerprint) or self.db.allocate_sku(self.config["sku_seed"])
                     conflict_retries = 0
                     while True:
@@ -230,6 +243,7 @@ class MainWindow(QMainWindow):
         file_grid.addWidget(self.sku_seed_edit, 2, 1)
         self.count_spin = QSpinBox()
         self.count_spin.setRange(1, 2_000_000)
+        self.count_spin.setValue(100)
         self.count_spin.valueChanged.connect(self.refresh_estimate)
         file_grid.addWidget(QLabel("本轮上传数量"), 3, 0)
         file_grid.addWidget(self.count_spin, 3, 1)
@@ -324,8 +338,6 @@ class MainWindow(QMainWindow):
             first_row = next(self.reader.rows(sheet, start_row=1, max_rows=1), (1, []))[1]
             rows = max(0, end - max(start, 1) + (0 if has_header_row(first_row) else 1))
             if rows:
-                if self.count_spin.value() <= 1:
-                    self.count_spin.setValue(min(rows, 100))
                 count = min(self.count_spin.value(), rows)
                 next_sku = self.preview_next_sku(self.sku_seed_edit.text())
                 last_sku = self.preview_sku_after(self.sku_seed_edit.text(), count)
