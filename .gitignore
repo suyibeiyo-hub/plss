@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+makro_uploader.sqlite3
+makro_uploader.sqlite3-shm
+makro_uploader.sqlite3-wal
+*.log
+*.makroauth
+*.har
+*.xlsx
+*.xls
+*.csv
+.DS_Store
+.github-token
