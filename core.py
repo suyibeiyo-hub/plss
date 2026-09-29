@@ -34,6 +34,9 @@ NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 NS_PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 DEFAULT_HEADERS = ["商品名称", "品牌", "价格(R)", "原价(R)", "优惠价(R)", "配送", "预计天数", "详情页地址"]
+# This is the location ID from the seller's HAR capture.  It is editable in
+# the GUI because a different seller account may use a different location.
+DEFAULT_LOCATION_ID = "LOCba655c1ccf6449c2a8f926e1818e78bb"
 
 
 def utc_now() -> str:
@@ -559,6 +562,69 @@ class MakroClient:
         except Exception as exc:  # network timeout, DNS, TLS, etc.
             return HttpResult(False, f"网络请求失败: {exc}", None, None)
         return self._interpret(raw, status)
+
+    def update_inventory(
+        self,
+        sku: str,
+        product_id: str,
+        location_id: str,
+        quantity: int,
+        timeout: float = 40,
+    ) -> HttpResult:
+        """Set non-FBF inventory for one SKU at one seller location."""
+        location_id = normalize_text(location_id)
+        url = (
+            f"{self.base_url}/napi/sfx/updateListingsInventory?"
+            f"{urllib.parse.urlencode({'sellerId': self.seller_id, 'locationId': location_id})}"
+        )
+        payload = {
+            sku: {
+                "product_id": normalize_text(product_id),
+                "locations": [{"id": location_id, "inventory": int(quantity)}],
+            }
+        }
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Content-Type": "application/json",
+                "Cookie": self.cookie,
+                "Origin": self.base_url,
+                "Referer": f"{self.base_url}/index.html",
+                "Sourceid": "ui.latch-on",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/153 Safari/537.36",
+                "X-Requested-With": "XMLHttpRequest",
+                "x-location-id": location_id,
+                **({"fk-csrf-token": self.csrf_token} if self.csrf_token else {}),
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+                status = int(response.status)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            return self._interpret_inventory(raw, int(exc.code), sku, quantity)
+        except Exception as exc:
+            return HttpResult(False, f"库存请求失败: {exc}", None, None)
+        return self._interpret_inventory(raw, status, sku, quantity)
+
+    @staticmethod
+    def _interpret_inventory(raw: str, status: int, sku: str, quantity: int) -> HttpResult:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            message = f"HTTP {status}: {raw[:500]}" if raw else f"HTTP {status}"
+            return HttpResult(False, message, status, raw[:4000])
+        item = data.get(sku, {}) if isinstance(data, dict) else {}
+        item_status = str(item.get("status", "")).upper() if isinstance(item, dict) else ""
+        if status < 400 and item_status == "SUCCESS":
+            return HttpResult(True, f"库存已设置为 {quantity}", status, data)
+        message = f"HTTP {status}: {json.dumps(data, ensure_ascii=False)[:1200]}"
+        return HttpResult(False, message, status, data)
 
     @staticmethod
     def _interpret(raw: str, status: int) -> HttpResult:

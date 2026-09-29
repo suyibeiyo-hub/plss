@@ -38,6 +38,7 @@ from core import (
     export_failed_xlsx,
     infer_mapping,
     DEFAULT_HEADERS,
+    DEFAULT_LOCATION_ID,
     has_header_row,
     make_listing_row,
     split_sku_seed,
@@ -88,6 +89,8 @@ class UploadWorker(QObject):
             run_id = self.db.create_run(path, self.config["sheet_name"], headers)
             client = MakroClient(self.config["seller_id"], self.config["cookie"], self.config["csrf_token"])
             total = self.config["count"]
+            inventory_quantity = self.config["inventory_quantity"]
+            location_id = self.config["location_id"]
             self.status.emit(f"开始上传，共 {total} 条。")
             processed = 0
             for row_number, raw_values in reader.rows(self.config["sheet_name"], start_row=data_start_row):
@@ -124,11 +127,30 @@ class UploadWorker(QObject):
                             break
                         result = client.upload(listing_row, sku)
                         if result.ok:
-                            status = "success"
-                            message = result.message
-                            success_count += 1
-                            self.db.add_upload(run_id, path, self.config["sheet_name"], listing_row, sku, status, message, result.http_status, result.response)
-                            self.row_result.emit({"row": row_number, "sku": sku, "product_id": product_id, "status": status, "message": message})
+                            self.status.emit(f"SKU {sku} 上架成功，准备设置库存 {inventory_quantity}")
+                            inventory_delay = random.uniform(self.config["delay_min"], self.config["delay_max"])
+                            if not wait_with_stop(inventory_delay, self.stop_event):
+                                status = "failure"
+                                message = "商品已上架，但设置库存前被停止"
+                                failure_count += 1
+                                response = {"listing": result.response, "inventory": None}
+                                self.db.add_upload(run_id, path, self.config["sheet_name"], listing_row, sku, status, message, result.http_status, response)
+                                self.row_result.emit({"row": row_number, "sku": sku, "product_id": product_id, "status": status, "message": message})
+                                break
+                            inventory_result = client.update_inventory(sku, product_id, location_id, inventory_quantity)
+                            response = {"listing": result.response, "inventory": inventory_result.response}
+                            if inventory_result.ok:
+                                status = "success"
+                                message = f"{result.message}；{inventory_result.message}"
+                                success_count += 1
+                                self.db.add_upload(run_id, path, self.config["sheet_name"], listing_row, sku, status, message, inventory_result.http_status, response)
+                                self.row_result.emit({"row": row_number, "sku": sku, "product_id": product_id, "status": status, "message": message})
+                            else:
+                                status = "failure"
+                                message = f"商品已上架，但库存设置失败：{inventory_result.message}"
+                                failure_count += 1
+                                self.db.add_upload(run_id, path, self.config["sheet_name"], listing_row, sku, status, message, inventory_result.http_status, response)
+                                self.row_result.emit({"row": row_number, "sku": sku, "product_id": product_id, "status": status, "message": message})
                             break
 
                         if not result.sku_conflict:
@@ -272,6 +294,13 @@ class MainWindow(QMainWindow):
         shipping_row.addWidget(QLabel("DAY"))
         shipping_row.addStretch()
         options.addRow("Pick Pack SLA", shipping_row)
+        self.inventory_spin = QSpinBox()
+        self.inventory_spin.setRange(0, 2_000_000)
+        self.inventory_spin.setValue(999)
+        options.addRow("上架后库存", self.inventory_spin)
+        self.location_edit = QLineEdit()
+        self.location_edit.setPlaceholderText("例如 LOCba655c1ccf6449c2a8f926e1818e78bb")
+        options.addRow("库存位置 ID", self.location_edit)
         root.addWidget(options_box)
 
         action_row = QHBoxLayout()
@@ -306,6 +335,8 @@ class MainWindow(QMainWindow):
     def _load_saved_settings(self) -> None:
         self.sku_seed_edit.setText(self.db.get_setting("last_sku_seed", "AA1001"))
         self.seller_edit.setText(self.db.get_setting("seller_id", ""))
+        self.inventory_spin.setValue(int(self.db.get_setting("inventory_quantity", "999") or "999"))
+        self.location_edit.setText(self.db.get_setting("location_id", DEFAULT_LOCATION_ID))
         # Older versions saved CSRF tokens.  They are session credentials and
         # should remain only in memory from now on.
         self.db.delete_setting("csrf_token")
@@ -376,11 +407,13 @@ class MainWindow(QMainWindow):
         sheet = self.sheet_combo.currentText().strip()
         cookie = self.cookie_edit.toPlainText().strip()
         seller_id = self.seller_edit.text().strip()
+        location_id = self.location_edit.text().strip()
         seed = self.sku_seed_edit.text().strip()
         if not path or not os.path.exists(path): return self.warn("请选择存在的 Excel 文件")
         if not cookie: return self.warn("请粘贴 Cookie")
         if not self.csrf_edit.text().strip(): return self.warn("请填写 CSRF Token")
         if not seller_id: return self.warn("请填写 Seller ID")
+        if not location_id: return self.warn("请填写库存位置 ID")
         try: split_sku_seed(seed)
         except ValueError as exc: return self.warn(str(exc))
         if not sheet: return self.warn("请选择工作表")
@@ -391,8 +424,9 @@ class MainWindow(QMainWindow):
         except Exception:
             count = self.count_spin.value()
         self.db.set_setting("last_sku_seed", seed); self.db.set_setting("seller_id", seller_id)
+        self.db.set_setting("inventory_quantity", str(self.inventory_spin.value())); self.db.set_setting("location_id", location_id)
         shipping_override = None if self.shipping_mode.currentData() == "excel" else str(self.shipping_days_spin.value())
-        config = {"file_path": path, "sheet_name": sheet, "cookie": cookie, "csrf_token": self.csrf_edit.text().strip(), "seller_id": seller_id, "sku_seed": seed, "count": count, "delay_min": 5, "delay_max": 8, "shipping_days_override": shipping_override}
+        config = {"file_path": path, "sheet_name": sheet, "cookie": cookie, "csrf_token": self.csrf_edit.text().strip(), "seller_id": seller_id, "sku_seed": seed, "count": count, "delay_min": 5, "delay_max": 8, "shipping_days_override": shipping_override, "inventory_quantity": self.inventory_spin.value(), "location_id": location_id}
         self.table.setRowCount(0); self.progress_bar.setValue(0); self.start_button.setEnabled(False); self.stop_button.setEnabled(True); self.export_button.setEnabled(False)
         self.thread = QThread(self); self.worker = UploadWorker(config); self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run); self.worker.row_result.connect(self.add_row); self.worker.progress.connect(lambda current, total: self.progress_bar.setValue(int(current * 100 / max(total, 1))))
